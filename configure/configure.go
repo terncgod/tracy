@@ -1,24 +1,31 @@
 package configure
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	l "log"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
+	"github.com/gorilla/websocket"
 	"github.com/nccgroup/tracy/api/types"
 	"github.com/nccgroup/tracy/log"
 )
 
 // Current holds all the configuration options for the current environment.
 var Current types.Configuration
+var eps string
+var configData interface{}
 
 func init() {
 	usr, err := user.Current()
@@ -60,12 +67,11 @@ func init() {
 		}
 	}
 	Current.TracyPath = tp
-	var configData interface{}
+
 	err = json.Unmarshal(content, &configData)
 	if err != nil {
 		l.Fatalf("Configuration file has a JSON syntax error: %s", err.Error())
 	}
-	SetupConfig(configData.(map[string]interface{}))
 
 	// Set up the command line interface.
 	var (
@@ -74,6 +80,7 @@ func init() {
 		certCacheFileUsage   = "Indicate the file to use for the certificate cache file."
 		certCacheFileDefault = "certificate-cache.json"
 		debugUIUsage         = "Indicate if you'd like the UI to use the non-compiled assets in the case of debugging."
+		proxyUsage           = "Indicate if the tracy proxy should have a proxy attached to it (should be specified in the form of <host>:<port>)."
 	)
 	// Database file. Allows the user to change the location of the SQLite database file.
 	flag.StringVar(&Current.DatabasePath, "database", filepath.Join(tp, databaseFileDefault), databaseFileUsage)
@@ -81,11 +88,14 @@ func init() {
 	flag.StringVar(&Current.CertCachePath, "certificate-cache", filepath.Join(tp, certCacheFileDefault), certCacheFileUsage)
 	// If you want to use the web UI, but don't want to compile all the assets
 	flag.BoolVar(&Current.DebugUI, "debug-ui", false, debugUIUsage)
+	// used to configure an external proxy
+	flag.StringVar(&eps, "proxy", "", proxyUsage)
 }
 
 // SetupConfig Unmarshals the configuration file into valid data structures
 // that can be easily digested at runtime.
-func SetupConfig(config map[string]interface{}) {
+func Setup() {
+	config := configData.(map[string]interface{})
 	tracers := config["tracers"].(map[string]interface{})
 	Current.TracerStrings = make(map[string]string, len(tracers))
 	for k, v := range tracers {
@@ -128,6 +138,18 @@ func SetupConfig(config map[string]interface{}) {
 	Current.PublicKeyLocation = config["public-key-loc"].(string)
 	Current.PrivateKeyLocation = config["private-key-loc"].(string)
 	Current.Version = config["version"].(string)
+
+	if eps != "" {
+		s, err := ParseServer(eps)
+		if err != nil {
+			l.Fatal(err)
+		}
+
+		Current.ExternalProxyServer = s
+	} else {
+		Current.ExternalProxyServer = types.Server{}
+	}
+
 }
 
 // ParseServer parses a string of the form <host>:<port> into a
@@ -157,18 +179,59 @@ func ParseServer(hp string) (types.Server, error) {
 	return types.Server{IPs: u, Port: uint(p), Hostname: splits[0]}, nil
 }
 
-// ProxyServer configures the TCP listener based on the user's configuration.
-func ProxyServer() net.Listener {
-	s := fmt.Sprintf("%s:%d",
-		Current.ProxyServer.IPs[0].String(),
-		Current.ProxyServer.Port)
-	ret, err := net.Listen("tcp", s)
+func useProxy(req *http.Request) (*url.URL, error) {
+	if Current.ExternalProxyServer.IsEmpty() {
+		return nil, nil
+	}
+	u, err := url.Parse(req.URL.Scheme + "://" + Current.ExternalProxyServer.Addr())
 	if err != nil {
-		/* Cannot continue if the application doesn't have TCP listener. Fail fast. */
-		log.Error.Fatalf("Cannot listen on %s: %+v", s, err)
+		log.Warning.Print(err)
+		return nil, err
 	}
 
-	return ret
+	return u, nil
+}
+
+// ProxyServer configures the TCP listener based on the user's configuration.
+func ProxyServer() (net.Listener, http.Transport, websocket.Dialer) {
+	s := fmt.Sprintf("%s:%d",
+		Current.ProxyServer.Hostname,
+		Current.ProxyServer.Port)
+	l, err := net.Listen("tcp", s)
+	if err != nil {
+		// Cannot continue if the application doesn't have TCP listener.
+		log.Error.Fatalf("Cannot listen on %s: %+v", s, err)
+	}
+	t := http.Transport{
+		Proxy: useProxy,
+		// If the scheme is HTTPS, need to the use the tls package to
+		// make the dial. We also don't care about insecure connections
+		// when using tracy. A lot the apps we are testing use dev or
+		// QA environments with self-signed certificates.
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+	}
+
+	w := websocket.Dialer{
+		Proxy: useProxy,
+		// If the scheme is HTTPS, need to the use the tls package to
+		// make the dial. We also don't care about insecure connections
+		// when using tracy. A lot the apps we are testing use dev or
+		// QA environments with self-signed certificates.
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		WriteBufferPool: &sync.Pool{
+			New: func() interface{} {
+				return make([]byte, 1024*4)
+			},
+		},
+	}
+
+	return l, t, w
 }
 
 // HostInWhitelist returns true if the host is in the whitelist of the

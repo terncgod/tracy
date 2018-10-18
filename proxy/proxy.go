@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
-	"crypto/tls"
+	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/gorilla/websocket"
 	"github.com/nccgroup/tracy/api/common"
 	"github.com/nccgroup/tracy/api/store"
 	"github.com/nccgroup/tracy/api/types"
@@ -32,7 +33,9 @@ var bufferPool = sync.Pool{
 // Proxy is the object that stores the configured proxy TCP listener
 // for the tracy proxy.
 type Proxy struct {
-	Listener net.Listener
+	Listener        net.Listener
+	HTTPTransport   http.Transport
+	WebSocketDialer websocket.Dialer
 }
 
 // Accept is the wrapper function for accepting TCP connections for
@@ -45,15 +48,18 @@ func (p *Proxy) Accept() {
 			continue
 		}
 
-		go handleConnection(conn)
+		go p.handleConnection(conn)
 	}
 
 }
 
-// New instantiates a Proxy object with the passed in net.Listener.
-func New(listener net.Listener) *Proxy {
+// New instantiates a Proxy object with the passed in net.Listener,
+// http.Transport, and websocket.Dialer.
+func New(listener net.Listener, transport http.Transport, dialer websocket.Dialer) *Proxy {
 	return &Proxy{
-		Listener: listener,
+		Listener:        listener,
+		HTTPTransport:   transport,
+		WebSocketDialer: dialer,
 	}
 }
 
@@ -192,29 +198,44 @@ func handleConnect(client net.Conn, request *http.Request) (net.Conn, *http.Requ
 	c, isHTTPS, err := upgradeConnectionTLS(client, request.URL.Host)
 	if err != nil {
 		log.Warning.Println(err)
-		return nil, nil, false, err
+		return nil, nil, isHTTPS, err
 	}
 
 	// After the connection has been upgraded, reread the request
 	// structure over TLS.
-	request, err = http.ReadRequest(bufio.NewReader(c))
+	req, err := http.ReadRequest(bufio.NewReader(c))
 
 	if err == io.EOF {
-		return nil, nil, false, err
+		return nil, nil, isHTTPS, err
 	}
 
 	if err != nil {
 		log.Warning.Println(err)
-		return nil, nil, false, err
+		return nil, nil, isHTTPS, err
 	}
 
-	return c, request, isHTTPS, nil
+	/*req.URL = &url.URL{
+		Scheme:     request.URL.Scheme,
+		Opaque:     request.URL.Opaque,
+		User:       request.URL.User,
+		Host:       request.URL.Host,
+		Path:       request.URL.Path,
+		RawPath:    request.URL.RawPath,
+		ForceQuery: request.URL.ForceQuery,
+		RawQuery:   request.URL.RawQuery,
+		Fragment:   request.URL.Fragment,
+	}
+	if isHTTPS {
+		req.URL.Scheme = "https"
+	}*/
+
+	return c, req, isHTTPS, nil
 }
 
 // handleConnection handles any TCP connections to the proxy. Client refers to
 // the client making the connection to the proxy. Server refers to the actual
 // server they are attempting to connect to after going through the proxy.
-func handleConnection(client net.Conn) {
+func (p *Proxy) handleConnection(client net.Conn) {
 	// Read a request structure from the TCP connection.
 	request, err := http.ReadRequest(bufio.NewReader(client))
 
@@ -227,8 +248,8 @@ func handleConnection(client net.Conn) {
 		return
 	}
 
-	isHTTPS := false
 	port := "80"
+	isHTTPS := false
 	// If the request method is 'CONNECT', it's either a TLS connection or a
 	// websocket.
 	if request.Method == http.MethodConnect {
@@ -264,7 +285,13 @@ func handleConnection(client net.Conn) {
 		host = request.Host + ":" + port
 	}
 
-	path := request.RequestURI
+	var path string
+	if request.URL.RawQuery != "" {
+		path = fmt.Sprintf("%s?%s", request.URL.Path, request.URL.RawQuery)
+	} else {
+		path = fmt.Sprintf("%s", request.URL.Path)
+	}
+
 	// Requests with the custom HTTP header "X-TRACY" are opting out of the
 	// swapping of tracy payloads. Also, we keep a whitelist of hosts that
 	// shouldn't swap out tracy payloads so that recursion issues don't
@@ -297,9 +324,6 @@ func handleConnection(client net.Conn) {
 		// Check if the host is the tracer API server. We don't want to
 		// trigger anything if we accidentally proxied a tracer server
 		// API call because it will cause a recursion.
-		if host == "" {
-			log.Error.Printf("%+v", request)
-		}
 		if !configure.HostInWhitelist(host) && len(tracers) > 0 {
 			go func() {
 				// Have to do this again because we changed the
@@ -369,7 +393,7 @@ func handleConnection(client net.Conn) {
 
 		resp.Write(client)
 	} else {
-		b, err = connectToTarget(isHTTPS, host, path, request, client)
+		err = p.connectToTarget(isHTTPS, host, path, request, client)
 		if err == io.EOF {
 			return
 		}
@@ -383,53 +407,7 @@ func handleConnection(client net.Conn) {
 
 // connectToTarget connects to a backend server, sends the
 // proxied request, and reads the response as a slice of bytes.
-func connectToTarget(isHTTPS bool, host, path string, req *http.Request, client net.Conn) ([]byte, error) {
-	var (
-		err    error
-		server net.Conn
-	)
-
-	// Based on the scheme, the API is different to backside of the proxy connection.
-	// TODO: I think we can change the default transport here to timeout a
-	// bit faster and to reuse connections.
-	if !isHTTPS {
-		if strings.Index(host, ":") == -1 {
-			server, err = net.Dial("tcp", host+":80")
-		} else {
-			server, err = net.Dial("tcp", host)
-		}
-
-		if server != nil {
-			defer server.Close()
-		}
-
-		if err != nil {
-			log.Warning.Print(err)
-			return []byte{}, err
-		}
-	} else {
-		var tserver *tls.Conn
-		// If the scheme is HTTPS, need to the use the tls package to
-		// make the dial. We also don't care about insecure connections
-		// when using tracy. A lot the apps we are testing use dev or
-		// QA environments with self-signed certificates.
-		tserver, err = tls.Dial("tcp", host, &tls.Config{
-			InsecureSkipVerify: true,
-		})
-
-		// Have to check for nil differently with tls.Dial because it
-		// returns a pointer of a connection instead of a struct.
-		var nilTest *tls.Conn
-		if tserver != nilTest {
-			server = tserver
-			defer server.Close()
-		}
-
-		if err != nil {
-			log.Warning.Print(err)
-			return []byte{}, err
-		}
-	}
+func (p *Proxy) connectToTarget(isHTTPS bool, host, path string, req *http.Request, client net.Conn) error {
 
 	// If we are prepping the cache, remove any cache headers.
 	prepingCache := strings.EqualFold(req.Header.Get("X-TRACY"), "set-cache")
@@ -438,28 +416,67 @@ func connectToTarget(isHTTPS bool, host, path string, req *http.Request, client 
 		req.Header.Del("Etag")
 		req.Header.Del("Cache-Control")
 	}
-	// Write the entire request to the backside connection of the proxy.
-	req.Write(server)
 
-	resp, err := http.ReadResponse(bufio.NewReader(server), nil)
-	if resp != nil {
-		defer resp.Body.Close()
+	req.URL.Host = host
+	req.URL.Path = path
+	if req.Header.Get("Upgrade") == "websocket" {
+		var scheme string
+		if isHTTPS {
+			scheme = "wss"
+		} else {
+			scheme = "ws"
+		}
+
+		concat := []byte(req.Header.Get("Sec-Websocket-Key") + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+		sha1 := sha1.Sum(concat)
+		challengeResponse := base64.StdEncoding.EncodeToString(sha1[:])
+
+		req.Header.Del("Sec-Websocket-Version")
+		req.Header.Del("Sec-Websocket-Extensions")
+		req.Header.Del("Sec-Websocket-Key")
+		req.Header.Del("Connection")
+		req.Header.Del("Upgrade")
+
+		server, resp, err := p.WebSocketDialer.Dial(scheme+"://"+host+path, req.Header)
+		if err != nil {
+			log.Warning.Print(err)
+			return err
+		}
+
+		defer server.Close()
+
+		//replace the challenge response
+		//resp.Header.Set("Sec-WebSocket-Accept", challengeResponse)
+		// tell the client you are switching protocols.
+		resp.Write(client)
+
+		// then bridge the sockets together and send bytes to eachother
+
+		s := server.UnderlyingConn()
+		go bridge(client, s)
+		bridge(s, client)
+		return nil
 	}
 
-	if err == io.EOF {
-		return []byte{}, nil
+	if isHTTPS {
+		req.URL.Scheme = "https"
+		req.URL.Host = host
+	} else {
+		req.URL.Scheme = "http"
+		req.URL.Host = host
 	}
 
+	resp, err := p.HTTPTransport.RoundTrip(req)
 	if err != nil {
-		log.Warning.Print(err)
-		return []byte{}, err
+		log.Error.Print(err)
+		return err
 	}
 
 	var save bytes.Buffer
 	b, err := ioutil.ReadAll(io.TeeReader(resp.Body, &save))
 	if err != nil {
 		log.Warning.Print(err)
-		return []byte{}, err
+		return err
 	}
 	resp.Body = ioutil.NopCloser(&save)
 
@@ -472,7 +489,7 @@ func connectToTarget(isHTTPS bool, host, path string, req *http.Request, client 
 		respb, err := httputil.DumpResponse(resp, true)
 		if err != nil {
 			log.Warning.Print(err)
-			return []byte{}, err
+			return err
 		}
 
 		go prepCache(respb, host, path, req.Method)
@@ -488,19 +505,7 @@ func connectToTarget(isHTTPS bool, host, path string, req *http.Request, client 
 	// Write the response back to the client.
 	resp.Write(client)
 
-	// If the backside of the proxy tries to change the protocol, forward
-	// this change and simply copy the bytes between the two connections
-	//until they are finished.
-	if resp.StatusCode == http.StatusSwitchingProtocols {
-		// Bridge blocks until the connections are finished talking, so
-		// client-to-server communication needs to be in its own goroutine.
-		go bridge(client, server)
-		// Block on server-to-client communication until both connections
-		// are finished.
-		bridge(server, client)
-	}
-
-	return b, nil
+	return nil
 }
 
 // prepCache processes a copy of the HTTP response so that it is uncompressed
@@ -606,12 +611,13 @@ func getCachedResponse(url, method string) ([]byte, error) {
 // TODO: add code to look for tracy payloads in websockets so that
 // we can identify when sources of input include data coming from the server in
 // websocket.
-func bridge(src net.Conn, dst net.Conn) {
+func bridge(src, dst net.Conn) {
 	buf := bufferPool.Get().([]byte)
 
 	// CopyBuffer copies between the two parties until an EOF is found.
 	if _, err := io.CopyBuffer(src, dst, buf); err != nil {
 		log.Error.Println(err)
 	}
+
 	bufferPool.Put(buf)
 }

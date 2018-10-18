@@ -28,9 +28,10 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 	// Open a TCP listener.
-	ln := configure.ProxyServer()
+	ln, tr, wd := configure.ProxyServer()
+
 	// Create the proxy
-	p := proxy.New(ln)
+	p := proxy.New(ln, tr, wd)
 	// Start the proxy that will run forever
 	go p.Accept()
 
@@ -69,6 +70,9 @@ func init() {
 
 	// Set up the logging based on the user command line flags.
 	log.Configure()
+
+	// Set up the configuration.
+	configure.Setup()
 
 	if *cpuprofile != "" {
 		f, err := os.Create(*cpuprofile)

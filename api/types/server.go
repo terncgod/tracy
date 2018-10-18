@@ -32,3 +32,12 @@ func (a *Server) Equal(b Server) bool {
 	}
 	return false
 }
+
+// IsEmpty returns true if the Server is populated.
+func (a *Server) IsEmpty() bool {
+	if len(a.IPs) == 0 && a.Hostname == "" {
+		return true
+	}
+
+	return false
+}
