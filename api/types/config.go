@@ -1,14 +1,17 @@
 package types
 
-import "crypto/tls"
+import (
+	"crypto/tls"
+	"net/url"
+)
 
 // Configuration is a struct that holds the configration options for the
 // environment.
 type Configuration struct {
 	TracerStrings       map[string]string `json:TracerStrings`
-	ServerWhitelist     []Server          `json:ServerWhitelist`
-	TracerServer        Server            `json:TracerServer`
-	ProxyServer         Server            `json:ProxyServer`
+	ServerWhitelist     []*Server         `json:ServerWhitelist`
+	TracerServer        *Server           `json:TracerServer`
+	ProxyServer         *Server           `json:ProxyServer`
 	AutoLaunch          bool              `json:AutoLaunch`
 	PublicKeyLocation   string            `json:PublicKeylocation`
 	PrivateKeyLocation  string            `json:PrivateKeyLocation`
@@ -17,6 +20,6 @@ type Configuration struct {
 	DatabasePath        string            `json:DatabaseFile`
 	TracyPath           string            `json:TracyPath`
 	Version             string            `json:Version`
-	SigningCertificate  tls.Certificate   `json:SigningCertificate`
-	ExternalProxyServer Server            `json:ExternalProxyServer`
+	SigningCertificate  *tls.Certificate  `json:SigningCertificate`
+	ExternalProxyServer *url.URL          `json:ExternalProxyServer`
 }

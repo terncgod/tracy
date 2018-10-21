@@ -248,6 +248,7 @@ func setupProxy() (net.Listener, error) {
 	// Minimal steps needed to setup the proxy, configure the
 	// logging, setup the DB, create a proxy object and let it accept
 	log.Configure()
+	configure.Setup()
 	if err := store.Open(configure.Current.DatabasePath, log.Verbose); err != nil {
 		log.Error.Fatal(err.Error())
 		return nil, err
@@ -288,8 +289,8 @@ func setupProxy() (net.Listener, error) {
 	}
 	SetCertCache(cache)
 	configure.Certificates()
-	ln := configure.ProxyServer()
-	p := New(ln)
+	ln, h, t := configure.ProxyServer()
+	p := New(ln, h, t)
 	go p.Accept()
 	return ln, nil
 }

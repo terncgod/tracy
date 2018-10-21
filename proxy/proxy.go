@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"strings"
 	"sync"
 
@@ -105,14 +106,8 @@ func identifyRequestsforGeneratedTracer(dump, method string) {
 
 // identifyTracersInResponse looks for all the registered tracers in an HTTP
 // response and makes an event for each of them.
-func identifyTracersInResponse(b []byte, host, url string, gziped bool) {
-	// Check if the host is the tracer API server. We don't want to trigger
-	// anything if we accidentally proxied a tracer server API call because
-	// it will cause a recursion.
-	if host == "" {
-		log.Error.Printf("EMPTY: %s", url)
-	}
-	if configure.HostInWhitelist(host) {
+func identifyTracersInResponse(b []byte, reqURL *url.URL, gziped bool) {
+	if configure.HostInWhitelist(reqURL.Host) {
 		return
 	}
 
@@ -153,7 +148,7 @@ func identifyTracersInResponse(b []byte, host, url string, gziped bool) {
 		return
 	}
 
-	tracers := findTracersInResponseBody(string(b), url, requests)
+	tracers := findTracersInResponseBody(string(b), reqURL.String(), requests)
 
 	if len(tracers) == 0 {
 		return
@@ -205,29 +200,9 @@ func handleConnect(client net.Conn, request *http.Request) (net.Conn, *http.Requ
 	// structure over TLS.
 	req, err := http.ReadRequest(bufio.NewReader(c))
 
-	if err == io.EOF {
-		return nil, nil, isHTTPS, err
-	}
-
 	if err != nil {
-		log.Warning.Println(err)
 		return nil, nil, isHTTPS, err
 	}
-
-	/*req.URL = &url.URL{
-		Scheme:     request.URL.Scheme,
-		Opaque:     request.URL.Opaque,
-		User:       request.URL.User,
-		Host:       request.URL.Host,
-		Path:       request.URL.Path,
-		RawPath:    request.URL.RawPath,
-		ForceQuery: request.URL.ForceQuery,
-		RawQuery:   request.URL.RawQuery,
-		Fragment:   request.URL.Fragment,
-	}
-	if isHTTPS {
-		req.URL.Scheme = "https"
-	}*/
 
 	return c, req, isHTTPS, nil
 }
@@ -248,10 +223,13 @@ func (p *Proxy) handleConnection(client net.Conn) {
 		return
 	}
 
-	port := "80"
-	isHTTPS := false
 	// If the request method is 'CONNECT', it's either a TLS connection or a
 	// websocket.
+
+	// URL is not fully built, so parse it here and rebuild it
+	port := "80"
+	protocol := "http"
+	isHTTPS := false
 	if request.Method == http.MethodConnect {
 		client, request, isHTTPS, err = handleConnect(client, request)
 		if err == io.EOF {
@@ -261,8 +239,45 @@ func (p *Proxy) handleConnection(client net.Conn) {
 			log.Error.Print(err)
 			return
 		}
+
 		if isHTTPS {
 			port = "443"
+			protocol = "https"
+		}
+	}
+
+	// ReadRequest doesn't properly build the request object from a raw socket
+	// by itself, so we need to ammend some of the fields so we can use them
+	// later.
+
+	// RequestURI is not supposed to be set if we are sending it back again
+	//request.RequestURI = ""
+
+	ports := strings.Split(request.Host, ":")
+	var host string
+	if len(ports) == 2 {
+		host = request.Host
+	} else {
+		host = request.Host + ":" + port
+	}
+	var path string
+	if request.URL.RawQuery != "" {
+		path = fmt.Sprintf("%s?%s", request.URL.Path, request.URL.RawQuery)
+	} else {
+		path = fmt.Sprintf("%s", request.URL.Path)
+	}
+
+	u, err := url.Parse(protocol + "://" + host + path)
+	if err != nil {
+		return
+	}
+	request.URL = u
+
+	if request.Header.Get("Upgrade") == "websocket" {
+		if request.URL.Scheme == "https" {
+			request.URL.Scheme = "wss"
+		} else {
+			request.URL.Scheme = "ws"
 		}
 	}
 
@@ -277,31 +292,13 @@ func (p *Proxy) handleConnection(client net.Conn) {
 		defer client.Close()
 	}
 
-	ports := strings.Split(request.Host, ":")
-	var host string
-	if len(ports) == 2 {
-		host = request.Host
-	} else {
-		host = request.Host + ":" + port
-	}
-
-	var path string
-	if request.URL.RawQuery != "" {
-		path = fmt.Sprintf("%s?%s", request.URL.Path, request.URL.RawQuery)
-	} else {
-		path = fmt.Sprintf("%s", request.URL.Path)
-	}
-
 	// Requests with the custom HTTP header "X-TRACY" are opting out of the
 	// swapping of tracy payloads. Also, we keep a whitelist of hosts that
 	// shouldn't swap out tracy payloads so that recursion issues don't
 	// happen. For example, tracy payloads will occur all over the UI and
 	// we don't want those to be swapped.
 	xTracyHeader := request.Header.Get("X-TRACY")
-	if host == "" {
-		log.Error.Printf("%+v", request)
-	}
-	if !configure.HostInWhitelist(host) && xTracyHeader == "" {
+	if !configure.HostInWhitelist(request.URL.Host) && xTracyHeader == "" {
 		// Look for tracers that might have been generated out-of-band
 		// using the API. Do this by checking if there exists a tracer,
 		// but we have no record of which request it came from.
@@ -324,7 +321,7 @@ func (p *Proxy) handleConnection(client net.Conn) {
 		// Check if the host is the tracer API server. We don't want to
 		// trigger anything if we accidentally proxied a tracer server
 		// API call because it will cause a recursion.
-		if !configure.HostInWhitelist(host) && len(tracers) > 0 {
+		if !configure.HostInWhitelist(request.URL.Host) && len(tracers) > 0 {
 			go func() {
 				// Have to do this again because we changed the
 				// contents of the request and the request object
@@ -369,7 +366,7 @@ func (p *Proxy) handleConnection(client net.Conn) {
 			log.Error.Print(`incorrect usage of GET-CACHE header. expected "GET-CACHE;<BASE64(EXPLOIT:TRACERSTRING)>"`)
 			return
 		}
-		b, err = getCachedResponse(host+path, request.Method)
+		b, err = getCachedResponse(request.URL.String(), request.Method)
 		if err != nil {
 			// If the cache didn't have an entry for this request and host
 			// we should fall back to making the actual HTTP request.
@@ -393,7 +390,7 @@ func (p *Proxy) handleConnection(client net.Conn) {
 
 		resp.Write(client)
 	} else {
-		err = p.connectToTarget(isHTTPS, host, path, request, client)
+		err = p.connectToTarget(request, client)
 		if err == io.EOF {
 			return
 		}
@@ -407,8 +404,7 @@ func (p *Proxy) handleConnection(client net.Conn) {
 
 // connectToTarget connects to a backend server, sends the
 // proxied request, and reads the response as a slice of bytes.
-func (p *Proxy) connectToTarget(isHTTPS bool, host, path string, req *http.Request, client net.Conn) error {
-
+func (p *Proxy) connectToTarget(req *http.Request, client net.Conn) error {
 	// If we are prepping the cache, remove any cache headers.
 	prepingCache := strings.EqualFold(req.Header.Get("X-TRACY"), "set-cache")
 	if prepingCache {
@@ -417,16 +413,7 @@ func (p *Proxy) connectToTarget(isHTTPS bool, host, path string, req *http.Reque
 		req.Header.Del("Cache-Control")
 	}
 
-	req.URL.Host = host
-	req.URL.Path = path
 	if req.Header.Get("Upgrade") == "websocket" {
-		var scheme string
-		if isHTTPS {
-			scheme = "wss"
-		} else {
-			scheme = "ws"
-		}
-
 		concat := []byte(req.Header.Get("Sec-Websocket-Key") + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
 		sha1 := sha1.Sum(concat)
 		challengeResponse := base64.StdEncoding.EncodeToString(sha1[:])
@@ -437,7 +424,7 @@ func (p *Proxy) connectToTarget(isHTTPS bool, host, path string, req *http.Reque
 		req.Header.Del("Connection")
 		req.Header.Del("Upgrade")
 
-		server, resp, err := p.WebSocketDialer.Dial(scheme+"://"+host+path, req.Header)
+		server, resp, err := p.WebSocketDialer.Dial(req.URL.String(), req.Header)
 		if err != nil {
 			log.Warning.Print(err)
 			return err
@@ -446,27 +433,21 @@ func (p *Proxy) connectToTarget(isHTTPS bool, host, path string, req *http.Reque
 		defer server.Close()
 
 		//replace the challenge response
-		//resp.Header.Set("Sec-WebSocket-Accept", challengeResponse)
+		resp.Header.Set("Sec-WebSocket-Accept", challengeResponse)
 		// tell the client you are switching protocols.
 		resp.Write(client)
 
 		// then bridge the sockets together and send bytes to eachother
-
 		s := server.UnderlyingConn()
 		go bridge(client, s)
 		bridge(s, client)
 		return nil
 	}
 
-	if isHTTPS {
-		req.URL.Scheme = "https"
-		req.URL.Host = host
-	} else {
-		req.URL.Scheme = "http"
-		req.URL.Host = host
-	}
-
 	resp, err := p.HTTPTransport.RoundTrip(req)
+	if resp != nil {
+		defer resp.Body.Close()
+	}
 	if err != nil {
 		log.Error.Print(err)
 		return err
@@ -475,9 +456,10 @@ func (p *Proxy) connectToTarget(isHTTPS bool, host, path string, req *http.Reque
 	var save bytes.Buffer
 	b, err := ioutil.ReadAll(io.TeeReader(resp.Body, &save))
 	if err != nil {
-		log.Warning.Print(err)
+		log.Error.Print(err)
 		return err
 	}
+
 	resp.Body = ioutil.NopCloser(&save)
 
 	// If the request has the X-TRACY: SET-CACHE value, make sure
@@ -492,26 +474,25 @@ func (p *Proxy) connectToTarget(isHTTPS bool, host, path string, req *http.Reque
 			return err
 		}
 
-		go prepCache(respb, host, path, req.Method)
+		go prepCache(respb, req.URL, req.Method)
 	} else {
 		// Search for any known tracers in the response. Since the list of tracers
 		// might get large, perform this operation in a goroutine.
 		// The proxy can finish this connection before this finishes.
 		// We don't need to do this in the cases where we are prepping the cache.
 		gzip := strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip")
-		go identifyTracersInResponse(b, host, req.Host+req.RequestURI, gzip)
+		go identifyTracersInResponse(b, req.URL, gzip)
 	}
 
 	// Write the response back to the client.
 	resp.Write(client)
-
 	return nil
 }
 
 // prepCache processes a copy of the HTTP response so that it is uncompressed
 // and unchunked before storing it in the cache. This makes it easier for us
 // to swap out the payloads.
-func prepCache(respbc []byte, host, path, method string) {
+func prepCache(respbc []byte, reqURL *url.URL, method string) {
 	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(respbc)), nil)
 	if resp != nil {
 		defer resp.Body.Close()
@@ -524,7 +505,7 @@ func prepCache(respbc []byte, host, path, method string) {
 		return
 	}
 
-	// NOTE: ioutil.ReadAll ahndles all the chunking.
+	// NOTE: ioutil.ReadAll handles all the chunking.
 	b, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		log.Error.Print(err)
@@ -568,15 +549,15 @@ func prepCache(respbc []byte, host, path, method string) {
 		return
 	}
 
-	setCacheResponse(host+path, method, respb)
+	setCacheResponse(reqURL, method, respb)
 }
 
 // cacheResponse adds a cache entry in the proxy cache for the HTTP response
 // corresponding to the method and URL. This happens only if the request
 // has been marked with the HTTP request header SET-CACHE.
-func setCacheResponse(url, method string, resp []byte) {
+func setCacheResponse(reqURL *url.URL, method string, resp []byte) {
 	r := &requestCacheSet{
-		url:    url,
+		url:    reqURL.String(),
 		method: method,
 		resp:   resp,
 	}
