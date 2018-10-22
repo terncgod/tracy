@@ -40,6 +40,7 @@ func init() {
 
 	// Write the server certificates.
 	pubKeyPath := filepath.Join(tp, "cert.pem")
+
 	if _, err = os.Stat(pubKeyPath); os.IsNotExist(err) {
 		generateRootCA(tp)
 	}
@@ -81,6 +82,7 @@ func init() {
 		certCacheFileDefault = "certificate-cache.json"
 		debugUIUsage         = "Indicate if you'd like the UI to use the non-compiled assets in the case of debugging."
 		proxyUsage           = "Indicate if the tracy proxy should have a proxy attached to it (should be specified in the form of <scheme>://<host>:<port>)."
+		reuseUsage           = "Indicates tracy will log whenever an HTTP connection is reused."
 	)
 	// Database file. Allows the user to change the location of the SQLite database file.
 	flag.StringVar(&Current.DatabasePath, "database", filepath.Join(tp, databaseFileDefault), databaseFileUsage)
@@ -88,8 +90,10 @@ func init() {
 	flag.StringVar(&Current.CertCachePath, "certificate-cache", filepath.Join(tp, certCacheFileDefault), certCacheFileUsage)
 	// If you want to use the web UI, but don't want to compile all the assets
 	flag.BoolVar(&Current.DebugUI, "debug-ui", false, debugUIUsage)
-	// used to configure an external proxy
+	// Used to configure an external proxy
 	flag.StringVar(&eps, "proxy", "", proxyUsage)
+	// Used to show reused HTTP connections.
+	flag.BoolVar(&Current.LogReusedHTTPConnections, "http-reuse", false, reuseUsage)
 }
 
 // SetupConfig Unmarshals the configuration file into valid data structures
@@ -137,7 +141,6 @@ func Setup() {
 
 	Current.PublicKeyLocation = config["public-key-loc"].(string)
 	Current.PrivateKeyLocation = config["private-key-loc"].(string)
-	log.Error.Printf("%+v", Current)
 	Current.Version = config["version"].(string)
 
 	if eps != "" {
@@ -201,8 +204,10 @@ func ProxyServer() (net.Listener, http.Transport, websocket.Dialer) {
 		// make the dial. We also don't care about insecure connections
 		// when using tracy. A lot the apps we are testing use dev or
 		// QA environments with self-signed certificates.
-		TLSClientConfig: &tlsConfig,
-		//		DisableKeepAlives: true,
+		TLSClientConfig:     &tlsConfig,
+		MaxIdleConns:        0,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     0,
 	}
 
 	w := websocket.Dialer{
